@@ -23,9 +23,23 @@ import { recordIapTip } from '../services/iapTip.service.js';
 const round2 = (n) => Math.round(n * 100) / 100;
 const UNSTARTED_TIMEOUT_STATUSES = ['pending', 'consent', 'waiting', 'scheduled'];
 const BOOKING_BLOCKING_STATUSES = ['pending', 'consent', 'waiting', 'scheduled', 'live', 'flagged', 'disputed'];
-const SLOT_STEP_MINUTES = 15;
+// Supported mobile durations are all multiples of five minutes. Use that as
+// the base grid, then align the visible starts to the selected duration.
+const SLOT_BASE_MINUTES = 5;
 const WEEKDAYS = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
 const SESSION_ASSET_STATUSES = ['completed', 'flagged', 'disputed'];
+
+// Some legacy Bangladesh advisor accounts kept the model's default `UTC`
+// value even though their schedule was entered in Bangladesh local time.
+// Resolve that known bad default without changing legitimate configured zones.
+export const resolveAdvisorTimezone = (user) => {
+  const configured = String(user?.timezone || '').trim();
+  const country = String(user?.country || '').trim().toUpperCase();
+  if ((!configured || configured === 'UTC') && country === 'BD') {
+    return 'Asia/Dhaka';
+  }
+  return configured || 'UTC';
+};
 
 const safeDownloadName = (value, fallback) => {
   const cleaned = String(value || '')
@@ -220,6 +234,17 @@ const matchingScheduleSlot = (weeklySchedule, date, timezone) => {
     slot.toMinutes <= slot.fromMinutes && slotContainsMinute(slot, minuteOfDay, { previousDay: true })
   );
   return previousSlot ? { weekday: prevWeekday, ...previousSlot } : null;
+};
+
+export const isDurationAlignedStart = (date, timezone, slot, durationMinutes) => {
+  if (!slot || durationMinutes <= 0) return false;
+  const parts = zonedParts(date, timezone);
+  const minuteOfDay = parts.hour * 60 + parts.minute;
+  let minutesFromWindowStart = minuteOfDay - slot.fromMinutes;
+  if (slot.toMinutes <= slot.fromMinutes && minuteOfDay < slot.toMinutes) {
+    minutesFromWindowStart += 24 * 60;
+  }
+  return minutesFromWindowStart >= 0 && minutesFromWindowStart % durationMinutes === 0;
 };
 
 const scheduleWindowsForDay = (weeklySchedule, weekday) => scheduleSlots(weeklySchedule?.[weekday])
@@ -452,7 +477,7 @@ const assertAdvisorSlotAvailable = async ({ advisorId, profile, start, durationM
   if (start > maxStart) {
     throw new ApiError(StatusCodes.BAD_REQUEST, 'This time is outside the advisor booking window');
   }
-  const timezone = profile?.user?.timezone || profile?.timezone || 'UTC';
+  const timezone = resolveAdvisorTimezone(profile?.user || profile);
   if (!settings.sameDayBooking && localDateKey(zonedParts(start, timezone)) === localDateKey(zonedParts(now, timezone))) {
     throw new ApiError(StatusCodes.BAD_REQUEST, 'Same-day booking is not available for this advisor');
   }
@@ -474,10 +499,10 @@ const assertAdvisorSessionTypeEnabled = (profile, type) => {
   }
 };
 
-const lockStartsForRange = (start, durationMinutes) => {
+export const lockStartsForRange = (start, durationMinutes) => {
   const slots = [];
   const duration = Math.max(1, Number(durationMinutes) || 15);
-  const stepMs = SLOT_STEP_MINUTES * 60 * 1000;
+  const stepMs = SLOT_BASE_MINUTES * 60 * 1000;
   const endMs = start.getTime() + duration * 60 * 1000;
   const firstSlotMs = Math.floor(start.getTime() / stepMs) * stepMs;
   for (let ms = firstSlotMs; ms < endMs; ms += stepMs) {
@@ -505,20 +530,20 @@ const reserveSlotLocks = async ({ advisorId, sessionId, start, durationMinutes }
 const releaseSlotLocks = (sessionId) => SessionSlotLock.deleteMany({ session: sessionId });
 
 export const buildAdvisorAvailability = async ({ advisorId, date, durationMinutes, viewerTimezone, viewerOffsetMinutes }) => {
-  const advisor = await User.findOne({ _id: advisorId, role: 'advisor' }).select('name timezone status');
+  const advisor = await User.findOne({ _id: advisorId, role: 'advisor' }).select('name timezone country status');
   if (!advisor) throw new ApiError(StatusCodes.NOT_FOUND, 'Advisor not found');
-  const profile = await AdvisorProfile.findOne({ user: advisorId }).populate('user', 'timezone');
+  const profile = await AdvisorProfile.findOne({ user: advisorId }).populate('user', 'timezone country');
   if (!profile) throw new ApiError(StatusCodes.NOT_FOUND, 'Advisor profile missing');
 
   const settings = availabilitySettings(profile);
   const duration = Math.max(1, Number(durationMinutes) || settings.defaultDurationMinutes);
   const viewer = {
-    timezone: viewerTimezone || advisor.timezone || 'UTC',
+    timezone: viewerTimezone || resolveAdvisorTimezone(advisor),
     offsetMinutes: viewerOffsetMinutes
   };
   const dateKey = /^\d{4}-\d{2}-\d{2}$/.test(date || '') ? date : localDateKey(viewerDateParts(new Date(), viewer));
   const [year, month, day] = dateKey.split('-').map((part) => Number.parseInt(part, 10));
-  const timezone = advisor.timezone || 'UTC';
+  const timezone = resolveAdvisorTimezone(advisor);
   const probeDate = new Date(Date.UTC(year, month - 1, day, 12, 0, 0));
   const weekday = zonedParts(probeDate, timezone).weekday;
   const { scheduleForDay, scheduleWindows } = availabilityForDate(profile, dateKey, weekday);
@@ -556,7 +581,7 @@ export const buildAdvisorAvailability = async ({ advisorId, date, durationMinute
     .filter(Boolean);
 
   const availableSlots = [];
-  for (let ms = searchStart.getTime(); ms < searchEnd.getTime(); ms += SLOT_STEP_MINUTES * 60 * 1000) {
+  for (let ms = searchStart.getTime(); ms < searchEnd.getTime(); ms += SLOT_BASE_MINUTES * 60 * 1000) {
     const start = new Date(ms);
     const end = new Date(ms + duration * 60 * 1000);
     if (start < minStart || start > maxStart) continue;
@@ -565,6 +590,7 @@ export const buildAdvisorAvailability = async ({ advisorId, date, durationMinute
     const startSlot = matchingAvailabilitySlot(profile, start, timezone);
     const endSlot = matchingAvailabilitySlot(profile, new Date(end.getTime() - 60 * 1000), timezone);
     if (!startSlot || !endSlot || (startSlot.weekday || startSlot.date) !== (endSlot.weekday || endSlot.date) || startSlot.from !== endSlot.from || startSlot.to !== endSlot.to) continue;
+    if (!isDurationAlignedStart(start, timezone, startSlot, duration)) continue;
     const overlaps = bookedDocs.some((session) => {
       const range = sessionRange(session);
       return range && rangesOverlap(
@@ -608,7 +634,7 @@ export const buildAdvisorAvailability = async ({ advisorId, date, durationMinute
     displayTimezoneOffsetMinutes: viewer.offsetMinutes,
     date: dateKey,
     durationMinutes: duration,
-    stepMinutes: SLOT_STEP_MINUTES,
+    stepMinutes: duration,
     sessionTypes: {
       chat: profile.sessionTypes?.chat !== false,
       call: profile.sessionTypes?.call !== false,
@@ -649,7 +675,7 @@ export const createBooking = catchAsync(async (req, res) => {
   if (!advisor) throw new ApiError(StatusCodes.NOT_FOUND, 'Advisor not found');
   if (advisor.status !== 'active') throw new ApiError(StatusCodes.FORBIDDEN, 'Advisor not available');
 
-  const profile = await AdvisorProfile.findOne({ user: advisorId }).populate('user', 'timezone');
+  const profile = await AdvisorProfile.findOne({ user: advisorId }).populate('user', 'timezone country');
   if (!profile) throw new ApiError(StatusCodes.NOT_FOUND, 'Advisor profile missing');
   assertAdvisorSessionTypeEnabled(profile, type);
 
@@ -1306,7 +1332,7 @@ export const rescheduleSession = catchAsync(async (req, res) => {
     throw new ApiError(StatusCodes.BAD_REQUEST, `Cannot reschedule session in status ${session.status}`);
   }
 
-  const profile = await AdvisorProfile.findOne({ user: session.advisor }).populate('user', 'timezone');
+  const profile = await AdvisorProfile.findOne({ user: session.advisor }).populate('user', 'timezone country');
   if (!profile) throw new ApiError(StatusCodes.NOT_FOUND, 'Advisor profile missing');
   const nextStart = new Date(newScheduledFor);
   await assertAdvisorSlotAvailable({
